@@ -252,7 +252,15 @@ onBeforeUnmount(() => {
             重试
           </el-button>
           <el-button v-if="row.status === 'COMPLETED'" size="small" @click="openChunks(row)">查看分块</el-button>
-          <el-button size="small" type="danger" plain @click="remove(row)">删除</el-button>
+          <!-- 后端禁止删除入库中的文档，前端提前禁用，避免确认后才被拒绝。 -->
+          <el-button
+            size="small"
+            type="danger"
+            plain
+            :disabled="row.status === 'PARSING' || row.status === 'EMBEDDING'"
+            :title="row.status === 'PARSING' || row.status === 'EMBEDDING' ? '入库处理中，请等待完成后删除' : '删除文档'"
+            @click="remove(row)"
+          >删除</el-button>
         </template>
       </el-table-column>
       <template #empty>

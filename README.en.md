@@ -111,7 +111,9 @@ src/
 
 - **IDs are strings**: the backend serializes all ID fields (19-digit snowflake IDs) as JSON strings — they exceed JavaScript's safe integer range (2^53) and would lose precision as numbers
 - **POST SSE**: streaming chat is POST + JSON body, which native EventSource doesn't support, so `text/event-stream` is parsed manually via fetch + ReadableStream; event order is `rewrittenQuestion` (multi-turn rewrites only) → `references` (JSON reference list) → repeated `delta` (answer increments) → `done`; any failure becomes an `error` event
-- **Stateless multi-turn**: the server keeps no session state; `history` is maintained by the frontend and sent with each request (chronological order, max 20 entries, matching backend validation)
+- **Input length**: chat and search questions are limited to 4096 characters, with a character counter and validation before sending
+- **Stateless multi-turn**: only complete, successful question/answer turns enter `history` (chronological order, max 20 entries). Each history copy retains at most the first 8192 UTF-16 code units while the full answer remains visible; failed or manually stopped turns are excluded
+- **Stream interruption**: a complete `done` or `error` event is required to finish; premature closure preserves the partial answer and shows a retry message. Switching knowledge bases or leaving the chat page cancels the current stream
 - **Async ingestion**: triggering ingestion after upload returns `PARSING` immediately; the frontend polls the document detail every 2 seconds until the terminal `COMPLETED`/`FAILED` status, then stops automatically
 
 ## 📄 License

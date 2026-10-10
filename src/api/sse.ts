@@ -43,52 +43,69 @@ export async function postSse(
     throw new Error(message)
   }
 
+  // 代理返回的 HTML 等非流式内容不能被静默当成空回答。
+  if (!response.headers.get('Content-Type')?.toLowerCase().includes('text/event-stream')) {
+    throw new Error('服务器未返回流式回答，请检查后端或代理配置')
+  }
+
   const reader = response.body.getReader()
   const decoder = new TextDecoder('utf-8')
   let buffer = ''
   let eventName = 'message'
   let dataLines: string[] = []
+  let terminalReceived = false
 
   // 一个事件以空行结束；多行 data 按 SSE 规范用换行拼接。
   const dispatch = () => {
     if (dataLines.length > 0) {
+      // 空 data 的 done 也是合法结束事件；error 表示服务端明确失败。
+      terminalReceived = eventName === 'done' || eventName === 'error'
       onEvent(eventName, dataLines.join('\n'))
     }
     eventName = 'message'
     dataLines = []
   }
 
-  for (;;) {
-    const { done, value } = await reader.read()
+  try {
+    for (;;) {
+      const { done, value } = await reader.read()
+      // EOF 并不表示模型正常完成，必须收到完整的 done/error 事件。
+      if (done) {
+        throw new Error('回答连接提前结束，请重试；本轮不计入后续对话历史')
+      }
+      buffer += decoder.decode(value, { stream: true })
 
-    if (done) {
-      break
+      let newlineIndex = buffer.indexOf('\n')
+      while (newlineIndex >= 0) {
+        const line = buffer.slice(0, newlineIndex).replace(/\r$/, '')
+        buffer = buffer.slice(newlineIndex + 1)
+        newlineIndex = buffer.indexOf('\n')
+
+        if (line === '') {
+          dispatch()
+          // 终态到达后立即结束，避免继续等待代理关闭连接。
+          if (terminalReceived) {
+            return
+          }
+          continue
+        }
+
+        // 冒号开头是注释行（如心跳），按规范忽略。
+        if (line.startsWith(':')) {
+          continue
+        }
+
+        if (line.startsWith('event:')) {
+          eventName = line.slice(6).replace(/^ /, '')
+        } else if (line.startsWith('data:')) {
+          // 规范要求去掉冒号后的单个空格，其余空白属于数据本身。
+          dataLines.push(line.slice(5).replace(/^ /, ''))
+        }
+      }
     }
-    buffer += decoder.decode(value, { stream: true })
-
-    let newlineIndex = buffer.indexOf('\n')
-    while (newlineIndex >= 0) {
-      const line = buffer.slice(0, newlineIndex).replace(/\r$/, '')
-      buffer = buffer.slice(newlineIndex + 1)
-      newlineIndex = buffer.indexOf('\n')
-
-      if (line === '') {
-        dispatch()
-        continue
-      }
-
-      // 冒号开头是注释行（如心跳），按规范忽略。
-      if (line.startsWith(':')) {
-        continue
-      }
-
-      if (line.startsWith('event:')) {
-        eventName = line.slice(6).replace(/^ /, '')
-      } else if (line.startsWith('data:')) {
-        // 规范要求去掉冒号后的单个空格，其余空白属于数据本身。
-        dataLines.push(line.slice(5).replace(/^ /, ''))
-      }
-    }
+  } finally {
+    // 异常、回调失败和终态均释放读取器；取消错误不覆盖原始失败原因。
+    await reader.cancel().catch(() => {})
+    reader.releaseLock()
   }
-  dispatch()
 }

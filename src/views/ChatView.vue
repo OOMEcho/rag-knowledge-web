@@ -1,6 +1,6 @@
 <script setup lang="ts">
 // 问答页：SSE 流式对话（多轮 + 引用来源）和"仅检索"调试两个 Tab。
-import { computed, nextTick, onMounted, reactive, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { useRoute } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import { CopyDocument, Delete, Promotion, VideoPause } from '@element-plus/icons-vue'
@@ -13,6 +13,8 @@ import type { KnowledgeBase, RagChatMessage, RagReference } from '../types/api'
 
 // 与后端 history 校验上限（@Size(max=20)）保持一致。
 const MAX_HISTORY = 20
+const MAX_QUESTION_LENGTH = 4096
+const MAX_HISTORY_CONTENT_LENGTH = 8192
 
 const markdown = new MarkdownIt({ breaks: true, linkify: true })
 
@@ -24,6 +26,8 @@ interface ChatMessage {
   references?: RagReference[]
   error?: boolean
   streaming?: boolean
+  completed?: boolean
+  notice?: string
 }
 
 const route = useRoute()
@@ -46,6 +50,8 @@ const searchReferences = ref<RagReference[] | null>(null)
 
 // 流式请求的取消控制器，"停止"按钮触发 abort。
 let abortController: AbortController | null = null
+// 切换知识库或离开页面后，旧检索响应不能覆盖新页面结果。
+let searchSequence = 0
 
 const selectedKb = computed(() => knowledgeBases.value.find((kb) => kb.id === selectedKbId.value))
 
@@ -58,19 +64,36 @@ const scrollToBottom = () => {
 }
 
 /**
- * 把已完成的对话消息转成后端 history 结构（不含当前提问），超限时保留最近的记录。
+ * 仅发送完整成功的问答轮次；历史副本裁剪到后端上限，界面仍显示完整回答。
  */
 const buildHistory = (): RagChatMessage[] => {
-  return messages.value
-    .filter((message) => !message.error && message.content)
-    .map<RagChatMessage>((message) => ({
-      role: message.role === 'user' ? 'USER' : 'ASSISTANT',
-      content: message.content,
-    }))
-    .slice(-MAX_HISTORY)
+  const history: RagChatMessage[] = []
+  for (let index = 0; index < messages.value.length - 1; index += 2) {
+    const user = messages.value[index]!
+    const assistant = messages.value[index + 1]!
+    // 失败、停止和未完成的回答不构成有效上下文，也排除该轮孤立的问题。
+    if (user.role !== 'user' || assistant.role !== 'assistant' || !assistant.completed || assistant.error
+      || !user.content.trim() || !assistant.content.trim()) {
+      continue
+    }
+    history.push(
+      { role: 'USER', content: historyContent(user.content) },
+      { role: 'ASSISTANT', content: historyContent(assistant.content) },
+    )
+  }
+  return history.slice(-MAX_HISTORY)
+}
+
+/** 历史副本先去掉首尾空白，再按后端 UTF-16 上限裁剪，避免空白片段和半个 emoji。 */
+const historyContent = (content: string): string => {
+  return content.trim().slice(0, MAX_HISTORY_CONTENT_LENGTH).replace(/[\uD800-\uDBFF]$/, '')
 }
 
 const send = async () => {
+  // 键盘事件也必须受此保护，避免同一页面同时创建两个流。
+  if (streaming.value) {
+    return
+  }
   const text = question.value.trim()
 
   if (!text) {
@@ -79,6 +102,10 @@ const send = async () => {
 
   if (selectedKbId.value === null) {
     ElMessage.warning('请先选择知识库')
+    return
+  }
+  if (text.length > MAX_QUESTION_LENGTH) {
+    ElMessage.warning(`问题最多 ${MAX_QUESTION_LENGTH} 个字符`)
     return
   }
   // history 必须在压入本轮提问前构造，否则当前问题会重复出现在历史里。
@@ -91,7 +118,8 @@ const send = async () => {
   streaming.value = true
   scrollToBottom()
 
-  abortController = new AbortController()
+  const controller = new AbortController()
+  abortController = controller
   try {
     await ragChatStream(
       {
@@ -102,6 +130,10 @@ const send = async () => {
         similarityThreshold: params.similarityThreshold,
       },
       (event, data) => {
+        // 已取消或属于上一个知识库的事件不能继续修改当前页面。
+        if (controller.signal.aborted || abortController !== controller) {
+          return
+        }
         // 按后端事件协议增量填充当前回答。
         if (event === 'rewrittenQuestion') {
           assistantMessage.rewrittenQuestion = data
@@ -111,28 +143,45 @@ const send = async () => {
           assistantMessage.content += data
         } else if (event === 'error') {
           assistantMessage.error = true
-          assistantMessage.content = data
+          assistantMessage.notice = data
+        } else if (event === 'done') {
+          // 只有后端明确结束成功的回答才能进入后续历史。
+          assistantMessage.completed = true
         }
         scrollToBottom()
       },
-      abortController.signal,
+      controller.signal,
     )
   } catch (error) {
-    // 用户主动停止不算错误，保留已生成的部分内容。
-    if ((error as Error).name !== 'AbortError') {
+    // 取消旧请求后可能已开启新对话，旧请求不能覆盖新请求的状态。
+    if (abortController === controller && !controller.signal.aborted) {
       assistantMessage.error = true
-      assistantMessage.content = (error as Error).message
+      assistantMessage.notice = (error as Error).message
     }
   } finally {
     assistantMessage.streaming = false
-    streaming.value = false
-    abortController = null
-    scrollToBottom()
+    if (abortController === controller) {
+      streaming.value = false
+      abortController = null
+      scrollToBottom()
+    }
   }
 }
 
 const stop = () => {
+  const assistant = messages.value[messages.value.length - 1]
+  // 保留部分文字供用户阅读，并明确标记该轮不进入后续上下文。
+  if (assistant?.streaming) {
+    assistant.notice = '已停止生成，本轮不计入后续对话历史'
+  }
+  cancelChat()
+}
+
+/** 切换知识库和卸载页面都需立即释放发送状态，同时使旧回调失效。 */
+const cancelChat = () => {
   abortController?.abort()
+  abortController = null
+  streaming.value = false
 }
 
 const clearConversation = () => {
@@ -149,6 +198,9 @@ const copyContent = async (content: string) => {
 }
 
 const runSearch = async () => {
+  if (searchLoading.value) {
+    return
+  }
   const text = searchQuestion.value.trim()
 
   if (!text) {
@@ -159,6 +211,11 @@ const runSearch = async () => {
     ElMessage.warning('请先选择知识库')
     return
   }
+  if (text.length > MAX_QUESTION_LENGTH) {
+    ElMessage.warning(`问题最多 ${MAX_QUESTION_LENGTH} 个字符`)
+    return
+  }
+  const sequence = ++searchSequence
   searchLoading.value = true
   searchReferences.value = null
   try {
@@ -168,18 +225,32 @@ const runSearch = async () => {
       topK: params.topK,
       similarityThreshold: params.similarityThreshold,
     })
-    searchReferences.value = response.references
+    if (sequence === searchSequence) {
+      searchReferences.value = response.references
+    }
   } catch (error) {
-    ElMessage.error((error as Error).message)
+    if (sequence === searchSequence) {
+      ElMessage.error((error as Error).message)
+    }
   } finally {
-    searchLoading.value = false
+    if (sequence === searchSequence) {
+      searchLoading.value = false
+    }
   }
 }
 
 // 切换知识库后上下文不再成立，清空当前对话。
 watch(selectedKbId, () => {
+  cancelChat()
+  ++searchSequence
+  searchLoading.value = false
   messages.value = []
   searchReferences.value = null
+}, { flush: 'sync' })
+
+onBeforeUnmount(() => {
+  cancelChat()
+  ++searchSequence
 })
 
 onMounted(async () => {
@@ -256,18 +327,21 @@ onMounted(async () => {
                   已根据上下文理解为：{{ message.rewrittenQuestion }}
                 </div>
                 <template v-if="message.role === 'assistant'">
-                  <el-alert v-if="message.error" :title="message.content" type="error" :closable="false" />
-                  <template v-else>
-                    <!-- 渲染前经 DOMPurify 清洗，模型输出中的脚本类内容不会执行 -->
-                    <div class="markdown-body" v-html="renderMarkdown(message.content)" />
-                    <span v-if="message.streaming" class="typing-cursor" />
-                    <ReferenceList v-if="message.references" :references="message.references" />
-                    <div v-if="!message.streaming && !message.error && message.content" class="message-actions">
-                      <el-button :icon="CopyDocument" size="small" text @click="copyContent(message.content)">
-                        复制
-                      </el-button>
-                    </div>
-                  </template>
+                  <el-alert
+                    v-if="message.notice"
+                    :title="message.notice"
+                    :type="message.error ? 'error' : 'warning'"
+                    :closable="false"
+                  />
+                  <!-- 渲染前经 DOMPurify 清洗，模型输出中的脚本类内容不会执行 -->
+                  <div class="markdown-body" v-html="renderMarkdown(message.content)" />
+                  <span v-if="message.streaming" class="typing-cursor" />
+                  <ReferenceList v-if="message.references" :references="message.references" />
+                  <div v-if="!message.streaming && !message.error && message.content" class="message-actions">
+                    <el-button :icon="CopyDocument" size="small" text @click="copyContent(message.content)">
+                      复制
+                    </el-button>
+                  </div>
                 </template>
                 <template v-else>{{ message.content }}</template>
               </div>
@@ -279,6 +353,8 @@ onMounted(async () => {
               v-model="question"
               type="textarea"
               :rows="2"
+              :maxlength="MAX_QUESTION_LENGTH"
+              show-word-limit
               resize="none"
               :placeholder="streaming ? '正在回答中…' : '输入问题，Enter 发送，Shift+Enter 换行'"
               :disabled="streaming"
@@ -296,6 +372,8 @@ onMounted(async () => {
             <div class="search-input-row">
               <el-input
                 v-model="searchQuestion"
+                :maxlength="MAX_QUESTION_LENGTH"
+                show-word-limit
                 placeholder="输入检索问题，直接查看混合检索（向量 + 关键词 RRF 融合）命中结果"
                 clearable
                 @keyup.enter="runSearch"
