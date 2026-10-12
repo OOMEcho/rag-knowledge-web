@@ -115,6 +115,7 @@ src/
 - **Stateless multi-turn**: only complete, successful question/answer turns enter `history` (chronological order, max 20 entries). Each history copy retains at most the first 8192 UTF-16 code units while the full answer remains visible; failed or manually stopped turns are excluded
 - **Stream interruption**: a complete `done` or `error` event is required to finish; premature closure preserves the partial answer and shows a retry message. Switching knowledge bases or leaving the chat page cancels the current stream
 - **Async ingestion**: triggering ingestion after upload returns `PARSING` immediately; the frontend polls the document detail every 2 seconds until the terminal `COMPLETED`/`FAILED` status, then stops automatically
+- **Startup recovery and deployment boundary**: the backend supports a single instance using its business database and upload directory. Ingestion and retry return HTTP 503 until startup recovery completes; the UI displays the backend message. A successful upload whose ingestion has not started remains Uploaded; click Ingest after the backend is ready. Failed documents can be retried later, without automatically resubmitting tasks. Retrieval validates candidates before selecting topK, so fewer references than requested are possible.
 
 ## 📄 License
 
